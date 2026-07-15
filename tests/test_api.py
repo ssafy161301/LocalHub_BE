@@ -23,9 +23,9 @@ def test_locations_and_crud():
     with TestClient(app) as client:
         assert client.get("/health").json()["database"] == "connected"
         categories = client.get("/api/v1/locations/categories").json()["data"]
-        assert len(categories) == 8
+        assert len(categories) == 7
         assert sum(item["count"] for item in categories) == 6518
-        assert next(item for item in categories if item["contentTypeId"] == "39")["count"] == 0
+        assert all(item["contentTypeId"] != "39" for item in categories)
 
         search = client.get("/api/v1/locations", params={"keyword": "서울숲"}).json()
         assert search["success"] and search["data"]["items"]
