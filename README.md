@@ -83,9 +83,8 @@ Location 1 ─── 0..N Post
 | 28 | 레포츠 | 126 |
 | 32 | 숙박 | 423 |
 | 38 | 쇼핑 | 4,368 |
-| 39 | 음식점 | 0 |
 
-`서울_음식점.json`은 현재 저장소에 없기 때문에 음식점은 0건입니다. 지역정보가 한 건이라도 존재하면 전체 seed를 건너뛰므로 원본 파일을 추가한 뒤 기존 DB에 자동으로 증분 반영되지는 않습니다.
+지역정보가 한 건이라도 존재하면 전체 seed를 건너뛰므로 원본 파일을 추가한 뒤 기존 DB에 자동으로 증분 반영되지는 않습니다.
 
 ## 로컬 개발
 
@@ -207,6 +206,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `history`는 모델 문맥에만 사용하고 DB 검색은 현재 `message`를 기준으로 합니다.
 - API 키가 없거나 OpenAI 호출이 실패하면 `502 CHAT_PROVIDER_ERROR`입니다.
 - 검색 결과가 없어도 OpenAI를 호출하고, 모델은 참고자료가 없다고 안내하도록 지시받습니다.
+- 답변은 Markdown이 아닌 일반 텍스트이며, 서버가 과도한 빈 줄과 줄 끝 공백을 정리합니다.
+- Vue의 답변 요소에는 `white-space: pre-line`을 적용해야 줄바꿈이 화면에 반영됩니다.
+- `강남갈만한 곳 추천좀`처럼 자주 쓰는 요청 표현을 붙여 입력해도 핵심어 `강남`을 분리해 검색합니다.
+- 정확 검색 결과가 없으면 한글 자모 유사도 기반 검색을 수행해 `강낭`처럼 가까운 오타도 관련 후보와 연결합니다.
 
 ## CORS와 Vue 연결
 
@@ -311,7 +314,7 @@ GET https://<backend-domain>/health
 → database: connected
 
 GET https://<backend-domain>/api/v1/locations/categories
-→ 8개 카테고리
+→ 7개 카테고리
 → 데이터 합계 6518
 
 OPTIONS https://<backend-domain>/api/v1/locations
