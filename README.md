@@ -71,6 +71,9 @@ Location 1 ─── 0..N Post
 1. SQLAlchemy `create_all()`로 없는 테이블을 생성합니다.
 2. `locations` 테이블이 비어 있으면 `data/서울/*.json`을 읽습니다.
 3. 모든 지역정보를 하나의 트랜잭션으로 적재합니다.
+4. `posts` 테이블이 비어 있으면 지역정보와 연결된 더미 게시글 30건을 적재합니다.
+
+더미 게시글은 여행후기, 정보공유, 질문, 동행구함 카테고리를 순환하며 제목에 `[더미]`가 붙습니다. 공통 비밀번호는 `DUMMY_POST_PASSWORD` 환경변수로 지정하고, 값이 없으면 `dummy1234`를 사용합니다. 게시글이 한 건이라도 존재하면 자동 더미 게시글 적재를 건너뜁니다.
 
 현재 저장소에는 7개 카테고리, 총 6,518건의 원본 데이터가 있습니다.
 
@@ -117,6 +120,7 @@ DATABASE_URL=sqlite:///./localhub.db
 ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5-mini
+DUMMY_POST_PASSWORD=dummy1234
 APP_ENV=development
 ```
 
@@ -126,6 +130,7 @@ APP_ENV=development
 | `ALLOWED_ORIGINS` | X | 로컬 Vite 주소 2개 | 쉼표로 구분한 허용 Origin |
 | `OPENAI_API_KEY` | 챗봇 사용 시 O | 없음 | OpenAI API 키 |
 | `OPENAI_MODEL` | X | `gpt-5-mini` | 챗봇 응답 모델 |
+| `DUMMY_POST_PASSWORD` | X | `dummy1234` | 서버 시작 시 생성하는 더미 게시글 30건의 공통 비밀번호 |
 | `APP_ENV` | X | `development` | `development`일 때 `run.py` reload 활성화 |
 | `PORT` | X | `8000` | `run.py` 서버 포트 |
 
@@ -269,6 +274,36 @@ python -m pytest -q
 - Vue 개발 Origin CORS preflight
 - 미허용 Origin 차단
 - 챗봇 핵심어 정규화, OR 검색, 관련도 정렬
+
+## 커뮤니티 더미 게시글 생성
+
+`scripts/seed_dummy_posts.py`는 DB를 직접 수정하지 않고 현재 구현된 API를 호출해 게시글을 생성합니다. 서버를 먼저 실행한 뒤 프로젝트 루트에서 실행하세요.
+
+Render 배포 서버에 기본 30건 생성:
+
+```powershell
+python scripts/seed_dummy_posts.py
+```
+
+기본 대상 서버:
+
+```text
+https://localhub-be-xflx.onrender.com
+```
+
+다른 서버를 사용하려면 `--base-url` 옵션으로 덮어쓸 수 있습니다.
+
+건수와 공통 비밀번호 지정:
+
+```powershell
+python scripts/seed_dummy_posts.py --count 30 --password dummy1234
+```
+
+- 지역정보 목록을 먼저 조회하고 각 게시글에 `locationId`를 연결합니다.
+- 제목은 `[더미]`로 시작하며 여행후기, 정보공유, 질문, 동행구함을 순환합니다.
+- 동일 제목이 이미 있으면 건너뛰며 `--force`를 사용하면 중복 생성합니다.
+- `--count`는 1~100, 비밀번호는 API 규칙과 동일하게 4~20자입니다.
+- Render 무료 Web Service의 SQLite 데이터는 재배포 시 사라질 수 있습니다.
 
 ## Render 배포
 
