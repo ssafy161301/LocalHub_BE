@@ -5,13 +5,15 @@ from itertools import cycle
 import httpx
 
 
-CATEGORIES = ("여행후기", "정보공유", "질문", "동행구함")
+CATEGORIES = (
+    "관광지", "문화시설", "축제", "여행코스", "레포츠", "숙박",
+    "쇼핑", "맛집", "여행후기", "정보공유", "질문",
+)
 DEFAULT_API_URL = "https://localhub-be-xflx.onrender.com"
 CONTENT_TEMPLATES = (
     "{location}에 직접 방문해 본 경험을 공유합니다. 교통편과 운영 시간을 미리 확인하면 더욱 편하게 둘러볼 수 있습니다.",
     "{location} 방문을 계획하는 분들을 위한 정보입니다. 방문 전 공식 안내와 현장 상황을 함께 확인해 주세요.",
-    "{location}에 가보신 분이 있다면 추천 관람 동선과 알아두면 좋은 팁을 댓글로 공유해 주세요.",
-    "이번 주말에 {location}을 함께 둘러볼 분을 찾습니다. 구체적인 시간과 만남 장소는 댓글로 조율하면 좋겠습니다.",
+    "{location}에 가보신 분이 있다면 추천 관람 동선과 알아두면 좋은 팁을 공유해 주세요.",
 )
 
 
@@ -61,15 +63,17 @@ def fetch_existing_dummy_titles(client: httpx.Client):
 
 def build_posts(locations, count: int, password: str):
     posts = []
-    category_cycle = cycle(enumerate(CATEGORIES))
+    category_cycle = cycle(CATEGORIES)
     for index in range(count):
         location = locations[index % len(locations)]
-        category_index, category = next(category_cycle)
+        category = next(category_cycle)
         location_title = location["title"]
         posts.append({
             "category": category,
             "title": f"[더미] {location_title} {category} #{index + 1}",
-            "content": CONTENT_TEMPLATES[category_index].format(location=location_title),
+            "content": CONTENT_TEMPLATES[index % len(CONTENT_TEMPLATES)].format(
+                location=location_title
+            ),
             "password": password,
             "locationId": location["id"],
         })
