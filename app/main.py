@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -8,6 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from rapidfuzz.fuzz import partial_ratio
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -33,17 +35,54 @@ CHAT_SUFFIXES = (
     "에는", "으로", "하고", "이며", "이나", "거나", "인데", "할",
     "은", "는", "이", "가", "을", "를", "과", "와", "의", "에", "로", "도", "만",
 )
+CHAT_REQUEST_SUFFIXES = (
+    "추천해주세요", "알려주세요", "찾아주세요", "추천해줘", "알려줘", "찾아줘",
+    "가볼만한곳", "갈만한곳", "놀만한곳", "볼만한곳", "먹을만한곳", "할만한곳",
+    "가볼만한", "갈만한", "놀만한", "볼만한", "먹을만한", "할만한",
+    "추천좀", "추천", "해줘", "해주세요", "있나요", "있는곳", "어디",
+)
+
+
+def normalize_chat_word(raw: str) -> str:
+    """Remove common Korean request endings even when users omit spaces."""
+    word = raw
+    if word in CHAT_REQUEST_SUFFIXES:
+        return ""
+    changed = True
+    while changed and len(word) >= 2:
+        changed = False
+        for suffix in CHAT_REQUEST_SUFFIXES + CHAT_SUFFIXES:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+                word = word[:-len(suffix)]
+                changed = True
+                break
+    return word
+
+
+def fuzzy_text(value: str) -> str:
+    """Decompose Hangul syllables so small Korean typos remain comparable."""
+    compact = "".join(re.findall(r"[0-9a-z가-힣]+", value.lower()))
+    return unicodedata.normalize("NFD", compact)
+
+
+def fuzzy_source_ids(rows, keywords: list[str], limit: int, threshold: float = 72):
+    """Return source IDs ranked by their best decomposed-Hangul similarity."""
+    normalized_keywords = [fuzzy_text(keyword) for keyword in keywords]
+    scored = []
+    for row in rows:
+        searchable = fuzzy_text(" ".join(str(value or "") for value in row[1:]))
+        score = max((partial_ratio(keyword, searchable) for keyword in normalized_keywords), default=0)
+        if score >= threshold:
+            scored.append((score, row[0]))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [source_id for _, source_id in scored[:limit]]
 
 
 def chat_keywords(message: str) -> list[str]:
     """Extract useful DB search terms from a natural-language chat message."""
     result = []
     for raw in re.findall(r"[0-9A-Za-z가-힣]+", message.lower()):
-        word = raw
-        for suffix in CHAT_SUFFIXES:
-            if word.endswith(suffix) and len(word) - len(suffix) >= 2:
-                word = word[:-len(suffix)]
-                break
+        word = normalize_chat_word(raw)
         if len(word) >= 2 and word not in CHAT_STOP_WORDS and word not in result:
             result.append(word)
     return result[:10]
@@ -77,6 +116,26 @@ def search_chat_sources(db: Session, message: str, limit: int = 10):
         select(Post).where(or_(*post_conditions)).limit(100)
     ).all()
 
+    # Exact/partial SQL matching remains the primary path. Fuzzy matching only
+    # runs for a source type with no result, limiting both false positives and cost.
+    if not location_candidates:
+        location_rows = db.execute(select(
+            Location.id, Location.title, Location.address, Location.category_name
+        )).all()
+        location_ids = fuzzy_source_ids(location_rows, keywords, limit)
+        if location_ids:
+            found = db.scalars(select(Location).where(Location.id.in_(location_ids))).all()
+            by_id = {item.id: item for item in found}
+            location_candidates = [by_id[item_id] for item_id in location_ids if item_id in by_id]
+
+    if not post_candidates:
+        post_rows = db.execute(select(Post.id, Post.title, Post.content, Post.category)).all()
+        post_ids = fuzzy_source_ids(post_rows, keywords, limit)
+        if post_ids:
+            found = db.scalars(select(Post).where(Post.id.in_(post_ids))).all()
+            by_id = {item.id: item for item in found}
+            post_candidates = [by_id[item_id] for item_id in post_ids if item_id in by_id]
+
     def location_score(item: Location):
         title = item.title.lower()
         address = (item.address or "").lower()
@@ -92,6 +151,14 @@ def search_chat_sources(db: Session, message: str, limit: int = 10):
     locations = sorted(location_candidates, key=location_score, reverse=True)[:limit]
     posts = sorted(post_candidates, key=post_score, reverse=True)[:limit]
     return keywords, locations, posts
+
+
+def normalize_chat_answer(answer: str) -> str:
+    """Keep plain-text chat responses readable and consistent for clients."""
+    normalized = answer.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    normalized = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", normalized)
+    return normalized.strip()
 
 
 def loc_summary(x: Location):
@@ -333,10 +400,20 @@ def chat(body: ChatBody, db: Session = Depends(get_db)):
         from openai import OpenAI, RateLimitError
         client = OpenAI()
         history = [{"role": x.role, "content": x.content} for x in body.history]
-        prompt = "당신은 서울 지역 안내 도우미입니다. 제공된 참고 자료 범위 안에서만 한국어로 답하고, 자료가 없으면 없다고 안내하세요.\n참고 자료:\n" + context
+        prompt = (
+            "당신은 서울 지역 안내 도우미입니다. 제공된 참고 자료 범위 안에서만 "
+            "한국어로 답하고, 자료가 없으면 없다고 안내하세요.\n"
+            "응답 형식 규칙:\n"
+            "- Markdown 문법(#, **, *, -, ```)을 사용하지 마세요.\n"
+            "- 일반 텍스트로 작성하고 문단 사이에는 빈 줄을 하나만 사용하세요.\n"
+            "- 여러 장소를 추천할 때는 '1. 장소명' 형태의 번호 목록을 사용하세요.\n"
+            "- 장소 설명은 핵심 정보만 간결하게 작성하세요.\n"
+            "- 불필요한 인사말과 같은 내용의 반복을 피하세요.\n"
+            "참고 자료:\n" + context
+        )
         response = client.responses.create(model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
             instructions=prompt, input=history + [{"role": "user", "content": body.message}])
-        return success({"answer": response.output_text, "references": refs})
+        return success({"answer": normalize_chat_answer(response.output_text), "references": refs})
     except RateLimitError:
         fail(429, "CHAT_RATE_LIMIT_EXCEEDED", "채팅 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.", {"retryAfterSeconds": 30})
     except Exception as exc:
