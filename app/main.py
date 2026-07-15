@@ -18,7 +18,7 @@ from .models import Location, Post
 from .responses import fail, pagination, success
 from .schemas import ChatBody, PasswordBody, PostCreate
 from .security import hash_password, verify_password
-from .seed import CATEGORY_NAMES, seed_locations
+from .seed import CATEGORY_NAMES, seed_dummy_posts, seed_locations
 
 
 logger = logging.getLogger(__name__)
@@ -201,6 +201,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         seed_locations(db)
+        seed_dummy_posts(db)
     yield
 
 
