@@ -10,7 +10,7 @@
 - 게시글 등록, 조회, 수정, 삭제
 - 게시글별 비밀번호 검증과 PBKDF2-SHA256 해시 저장
 - 지역정보·게시글 카테고리 통계
-- 질문 핵심어 기반 관련 자료 검색과 OpenAI 챗봇 응답
+- 대화 문맥·의도·지역·상황을 구조화해 검색하는 OpenAI 지역 안내 챗봇
 - 한국관광공사 데이터 출처·라이선스 정보
 - Vue/Vite 개발 및 배포 Origin을 위한 CORS 설정
 - Render Blueprint 기반 Web Service·SQLite 영속 디스크 배포
@@ -120,6 +120,7 @@ DATABASE_URL=sqlite:///./localhub.db
 ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5-mini
+OPENAI_INTENT_MODEL=gpt-5-mini
 DUMMY_POST_PASSWORD=dummy1234
 APP_ENV=development
 ```
@@ -130,6 +131,7 @@ APP_ENV=development
 | `ALLOWED_ORIGINS` | X | 로컬 Vite 주소 2개 | 쉼표로 구분한 허용 Origin |
 | `OPENAI_API_KEY` | 챗봇 사용 시 O | 없음 | OpenAI API 키 |
 | `OPENAI_MODEL` | X | `gpt-5-mini` | 챗봇 응답 모델 |
+| `OPENAI_INTENT_MODEL` | X | `OPENAI_MODEL` 값 | 질문 의도 분석 모델 |
 | `DUMMY_POST_PASSWORD` | X | `dummy1234` | 서버 시작 시 생성하는 더미 게시글 30건의 공통 비밀번호 |
 | `APP_ENV` | X | `development` | `development`일 때 `run.py` reload 활성화 |
 | `PORT` | X | `8000` | `run.py` 서버 포트 |
@@ -198,22 +200,26 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```text
 사용자 message
-  → 핵심어 추출·조사와 요청 표현 제거
-  → Location과 Post에서 부분 일치 후보 검색
-  → 제목·카테고리·주소·본문 일치 가중치로 정렬
-  → 상위 장소 10개 + 게시글 10개를 참고자료로 구성
-  → OpenAI Responses API 호출
-  → answer + references 반환
+  + 최근 history
+  → OpenAI Structured Outputs로 요청 유형·위치·조건·선호 분류 해석
+  → 해석된 검색어 부분 일치 + 선호 장소 분류로 후보 보완
+  → 위치·주제·카테고리 가중치로 후보 정렬
+  → 후보를 참고자료로 OpenAI Responses API 호출
+  → 실제 답변에 사용한 자료만 references로 반환
 ```
 
 - 대화 `history`는 DB에 저장하지 않습니다.
 - Vue가 최근 대화를 최대 20개까지 요청에 포함해야 합니다.
-- `history`는 모델 문맥에만 사용하고 DB 검색은 현재 `message`를 기준으로 합니다.
+- `history`의 최근 8개 항목을 의도 분석에도 사용하므로 `그중 실내는?` 같은 후속 질문의 생략된 조건을 복원할 수 있습니다.
+- 의도 분석은 추천·장소 검색·상세·비교·코스·지역정보·일상대화를 구분하고, 위치·활동·동행·상황·선호/제외 카테고리를 구조화합니다.
 - API 키가 없거나 OpenAI 호출이 실패하면 `502 CHAT_PROVIDER_ERROR`입니다.
+- 의도 분석만 실패하면 기존 핵심어 검색으로 폴백하고 답변 생성을 계속합니다.
 - 검색 결과가 없어도 OpenAI를 호출하고, 모델은 참고자료가 없다고 안내하도록 지시받습니다.
 - 답변은 Markdown이 아닌 일반 텍스트이며, 서버가 과도한 빈 줄과 줄 끝 공백을 정리합니다.
 - Vue의 답변 요소에는 `white-space: pre-line`을 적용해야 줄바꿈이 화면에 반영됩니다.
-- `강남갈만한 곳 추천좀`처럼 자주 쓰는 요청 표현을 붙여 입력해도 핵심어 `강남`을 분리해 검색합니다.
+- `역삼역 근처`, `비 오는 날 아이와`, `조용한 실내`, `숙박 말고`처럼 표현 방식이 달라도 고정 규칙이 아닌 AI 의도 분석 결과로 검색합니다.
+- 인사처럼 지역정보 검색이 필요 없는 대화는 DB 후보 검색을 생략합니다.
+- AI 의도 분석 장애 시에는 `강남갈만한 곳 추천좀` 같은 표현을 처리하는 기존 핵심어 정규화를 사용합니다.
 - 정확 검색 결과가 없으면 한글 자모 유사도 기반 검색을 수행해 `강낭`처럼 가까운 오타도 관련 후보와 연결합니다.
 
 ## CORS와 Vue 연결
@@ -273,7 +279,7 @@ python -m pytest -q
 - 공통 검증 및 오류 응답
 - Vue 개발 Origin CORS preflight
 - 미허용 Origin 차단
-- 챗봇 핵심어 정규화, OR 검색, 관련도 정렬
+- 챗봇 구조화 의도 분석, 문맥 복원, 카테고리 보완 검색, 폴백 검색
 
 ## 커뮤니티 더미 게시글 생성
 

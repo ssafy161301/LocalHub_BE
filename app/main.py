@@ -16,7 +16,9 @@ from sqlalchemy.orm import Session
 from .database import Base, SessionLocal, engine, get_db
 from .models import Location, Post
 from .responses import fail, pagination, success
-from .schemas import ChatBody, PasswordBody, PostCreate
+from .schemas import (
+    ChatBody, ChatGeneratedAnswer, ChatSearchIntent, PasswordBody, PostCreate,
+)
 from .security import hash_password, verify_password
 from .seed import CATEGORY_NAMES, seed_dummy_posts, seed_locations
 
@@ -88,13 +90,84 @@ def chat_keywords(message: str) -> list[str]:
     return result[:10]
 
 
-def search_chat_sources(db: Session, message: str, limit: int = 10):
-    """Find and rank sources that match at least one normalized keyword."""
-    keywords = chat_keywords(message)
-    if not keywords:
+def _unique_terms(values, limit: int) -> list[str]:
+    result = []
+    for raw in values:
+        value = str(raw or "").strip().lower()
+        if len(value) >= 2 and value not in result:
+            result.append(value)
+    return result[:limit]
+
+
+def analyze_chat_intent(client, message: str, history) -> ChatSearchIntent:
+    """Use structured model output to resolve a natural-language search intent."""
+    conversation = [
+        {"role": item.role, "content": item.content}
+        for item in history[-8:]
+    ]
+    instructions = (
+        "당신은 서울 지역정보 검색 질의 분석기입니다. 사용자의 문장을 단순 단어 분리가 아니라 "
+        "대화 문맥을 포함한 실제 의도로 해석하세요. 장소를 직접 추천하거나 사실을 답하지 말고 "
+        "검색 조건만 구조화하세요.\n"
+        "intent 규칙:\n"
+        "- recommendation: 조건에 맞는 장소 추천\n"
+        "- place_search: 장소나 지역 찾기\n"
+        "- place_detail: 특정 장소 정보 질문\n"
+        "- comparison: 장소 비교\n"
+        "- itinerary: 코스나 일정 구성\n"
+        "- local_information: 서울 지역 관련 정보 질문\n"
+        "- smalltalk: 인사 등 지역정보 검색이 불필요한 대화\n"
+        "필드 규칙:\n"
+        "- search_required는 저장된 장소/게시글 참고자료가 필요한 경우 true입니다.\n"
+        "- resolved_query에는 이전 대화의 생략된 조건까지 복원한 한 문장 의도를 작성하세요.\n"
+        "- location_terms에는 장소명, 동네, 구, 역 등 위치 표현만 넣으세요. 역 이름은 원문과 "
+        "주소 검색용 어간을 함께 넣으세요. 예: 역삼역 -> 역삼역, 역삼.\n"
+        "- search_terms에는 활동, 분위기, 동행, 상황, 시설명 등 의미 있는 조건을 넣되 "
+        "추천해줘/좋은 곳 같은 요청 표현은 제외하세요.\n"
+        "- preferred_categories는 관광지, 문화시설, 축제공연행사, 여행코스, 레포츠, 숙박, 쇼핑 "
+        "중 의도에 맞는 분류를 선택하세요. 특정 분류를 원하지 않으면 excluded_categories에 넣으세요.\n"
+        "- 사용자가 말하지 않은 구체적인 장소명이나 위치를 만들어내지 마세요."
+    )
+    response = client.responses.parse(
+        model=(os.getenv("OPENAI_INTENT_MODEL")
+               or os.getenv("OPENAI_MODEL", "gpt-5-mini")),
+        instructions=instructions,
+        input=conversation + [{"role": "user", "content": message}],
+        text_format=ChatSearchIntent,
+    )
+    if response.output_parsed is None:
+        raise ValueError("Chat intent response did not contain parsed output")
+    return response.output_parsed
+
+
+def search_chat_sources(
+    db: Session, message: str, limit: int = 10,
+    intent: ChatSearchIntent | None = None,
+):
+    """Find and rank sources using structured intent, with keyword fallback."""
+    if intent is not None and not intent.search_required:
         return [], [], []
 
+    if intent is None:
+        location_terms = []
+        search_terms = chat_keywords(message)
+        preferred_categories = []
+        excluded_categories = []
+    else:
+        location_terms = _unique_terms(intent.location_terms, 6)
+        search_terms = _unique_terms(intent.search_terms, 12)
+        preferred_categories = list(dict.fromkeys(intent.preferred_categories))
+        excluded_categories = set(intent.excluded_categories)
+
+    keywords = _unique_terms(location_terms + search_terms, 15)
+    if not keywords and not preferred_categories:
+        keywords = chat_keywords(message)
+    if not keywords:
+        if not preferred_categories:
+            return [], [], []
+
     location_conditions = []
+    location_scope_conditions = []
     post_conditions = []
     for keyword in keywords:
         pattern = f"%{keyword}%"
@@ -108,27 +181,72 @@ def search_chat_sources(db: Session, message: str, limit: int = 10):
             Post.content.ilike(pattern),
             Post.category.ilike(pattern),
         ))
+    for term in location_terms:
+        pattern = f"%{term}%"
+        location_scope_conditions.extend((
+            Location.title.ilike(pattern),
+            Location.address.ilike(pattern),
+        ))
 
-    location_candidates = db.scalars(
-        select(Location).where(or_(*location_conditions)).limit(100)
-    ).all()
-    post_candidates = db.scalars(
-        select(Post).where(or_(*post_conditions)).limit(100)
-    ).all()
+    location_candidates = []
+    post_candidates = []
+    if location_conditions:
+        location_stmt = select(Location).where(or_(
+            *(location_scope_conditions or location_conditions)
+        ))
+        if excluded_categories:
+            location_stmt = location_stmt.where(
+                Location.category_name.not_in(excluded_categories)
+            )
+        location_candidates = db.scalars(location_stmt.limit(200)).all()
+    if post_conditions:
+        post_candidates = db.scalars(
+            select(Post).where(or_(*post_conditions)).limit(200)
+        ).all()
+
+    # Natural-language conditions often do not literally occur in the source
+    # metadata. AI-selected categories therefore supplement the text matches.
+    # When a location was requested, keep category supplements inside that area.
+    category_rows = []
+    allowed_categories = [
+        name for name in preferred_categories if name not in excluded_categories
+    ]
+    if allowed_categories and location_terms:
+        category_stmt = select(Location).where(
+            Location.category_name.in_(allowed_categories),
+            or_(*location_scope_conditions),
+        )
+        category_rows = db.scalars(category_stmt.limit(200)).all()
+    elif allowed_categories:
+        per_category_limit = max(limit * 2, 30)
+        for category_name in allowed_categories:
+            category_rows.extend(db.scalars(
+                select(Location).where(
+                    Location.category_name == category_name
+                ).limit(per_category_limit)
+            ).all())
+
+    if category_rows:
+        seen_ids = {item.id for item in location_candidates}
+        location_candidates.extend(
+            item for item in category_rows if item.id not in seen_ids
+        )
 
     # Exact/partial SQL matching remains the primary path. Fuzzy matching only
     # runs for a source type with no result, limiting both false positives and cost.
-    if not location_candidates:
+    if not location_candidates and keywords:
         location_rows = db.execute(select(
             Location.id, Location.title, Location.address, Location.category_name
         )).all()
-        location_ids = fuzzy_source_ids(location_rows, keywords, limit)
+        location_ids = fuzzy_source_ids(
+            location_rows, location_terms or keywords, limit
+        )
         if location_ids:
             found = db.scalars(select(Location).where(Location.id.in_(location_ids))).all()
             by_id = {item.id: item for item in found}
             location_candidates = [by_id[item_id] for item_id in location_ids if item_id in by_id]
 
-    if not post_candidates:
+    if not post_candidates and keywords:
         post_rows = db.execute(select(Post.id, Post.title, Post.content, Post.category)).all()
         post_ids = fuzzy_source_ids(post_rows, keywords, limit)
         if post_ids:
@@ -140,13 +258,27 @@ def search_chat_sources(db: Session, message: str, limit: int = 10):
         title = item.title.lower()
         address = (item.address or "").lower()
         category = item.category_name.lower()
-        return sum(4 * (k in title) + 2 * (k in address) + 3 * (k in category) for k in keywords)
+        score = sum(9 * (k in title) + 7 * (k in address) for k in location_terms)
+        score += sum(
+            5 * (k in title) + 2 * (k in address) + 4 * (k in category)
+            for k in search_terms
+        )
+        score += 12 * (item.category_name in preferred_categories)
+        if intent is None:
+            score += sum(
+                4 * (k in title) + 2 * (k in address) + 3 * (k in category)
+                for k in keywords
+            )
+        return score
 
     def post_score(item: Post):
         title = item.title.lower()
         content = item.content.lower()
         category = item.category.lower()
-        return sum(4 * (k in title) + (k in content) + 3 * (k in category) for k in keywords)
+        return sum(
+            5 * (k in title) + 2 * (k in content) + 4 * (k in category)
+            for k in keywords
+        )
 
     locations = sorted(location_candidates, key=location_score, reverse=True)[:limit]
     posts = sorted(post_candidates, key=post_score, reverse=True)[:limit]
@@ -388,33 +520,86 @@ def data_source(db: Session = Depends(get_db)):
 
 @app.post("/api/v1/chat")
 def chat(body: ChatBody, db: Session = Depends(get_db)):
-    keywords, locations, posts = search_chat_sources(db, body.message)
-    refs = {"locations": [{k: v for k, v in loc_summary(x).items() if k not in ("contentTypeId", "longitude", "latitude")} for x in locations],
-            "posts": [{"id": x.id, "category": x.category, "title": x.title} for x in posts]}
     if not os.getenv("OPENAI_API_KEY"):
         fail(502, "CHAT_PROVIDER_ERROR", "채팅 응답을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요.")
-    context_items = [f"검색 핵심어: {', '.join(keywords)}"] if keywords else []
-    context_items += [f"장소: {x.title} / {x.category_name} / {x.address or ''}" for x in locations]
-    context_items += [f"게시글: {x.title} / {x.category} / {x.content[:300]}" for x in posts]
-    context = "\n".join(context_items) or "검색된 참고 자료 없음"
     try:
         from openai import OpenAI, RateLimitError
         client = OpenAI()
         history = [{"role": x.role, "content": x.content} for x in body.history]
+        try:
+            intent = analyze_chat_intent(client, body.message, body.history)
+        except RateLimitError:
+            raise
+        except Exception as exc:
+            logger.warning("OpenAI chat intent analysis failed; using keyword fallback", exc_info=exc)
+            intent = None
+
+        keywords, locations, posts = search_chat_sources(
+            db, body.message, limit=30, intent=intent
+        )
+        context_items = [
+            f"해석된 요청: {intent.resolved_query}"
+            if intent else f"검색 핵심어: {', '.join(keywords)}"
+        ]
+        context_items += [
+            f"[location:{x.id}] {x.title} / {x.category_name} / {x.address or ''}"
+            for x in locations
+        ]
+        context_items += [
+            f"[post:{x.id}] {x.title} / {x.category} / {x.content[:300]}"
+            for x in posts
+        ]
+        if not locations and not posts:
+            context_items.append("검색된 장소·게시글 후보: 없음")
+        context = "\n".join(context_items) or "검색된 참고 자료 없음"
         prompt = (
             "당신은 서울 지역 안내 도우미입니다. 제공된 참고 자료 범위 안에서만 "
-            "한국어로 답하고, 자료가 없으면 없다고 안내하세요.\n"
+            "구체적인 장소·게시글 정보를 한국어로 답하세요. 검색이 필요한 요청인데 자료가 "
+            "없으면 없다고 안내하세요. 인사처럼 검색이 필요 없는 대화에는 자연스럽고 짧게 답하세요.\n"
             "응답 형식 규칙:\n"
             "- Markdown 문법(#, **, *, -, ```)을 사용하지 마세요.\n"
             "- 일반 텍스트로 작성하고 문단 사이에는 빈 줄을 하나만 사용하세요.\n"
             "- 여러 장소를 추천할 때는 '1. 장소명' 형태의 번호 목록을 사용하세요.\n"
             "- 장소 설명은 핵심 정보만 간결하게 작성하세요.\n"
             "- 불필요한 인사말과 같은 내용의 반복을 피하세요.\n"
+            "- 답변에서 실제로 추천하거나 언급한 참고자료 ID만 location_ids와 post_ids에 넣으세요.\n"
+            "- 제공되지 않은 ID나 장소 정보는 만들지 마세요. 각 ID 배열은 최대 10개입니다.\n"
             "참고 자료:\n" + context
         )
-        response = client.responses.create(model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
-            instructions=prompt, input=history + [{"role": "user", "content": body.message}])
-        return success({"answer": normalize_chat_answer(response.output_text), "references": refs})
+        response = client.responses.parse(
+            model=os.getenv("OPENAI_MODEL", "gpt-5-mini"), instructions=prompt,
+            input=history + [{"role": "user", "content": body.message}],
+            text_format=ChatGeneratedAnswer,
+        )
+        generated = response.output_parsed
+        if generated is None:
+            raise ValueError("Chat answer response did not contain parsed output")
+
+        location_by_id = {item.id: item for item in locations}
+        post_by_id = {item.id: item for item in posts}
+        selected_locations = [
+            location_by_id[item_id] for item_id in dict.fromkeys(generated.location_ids)
+            if item_id in location_by_id
+        ]
+        selected_posts = [
+            post_by_id[item_id] for item_id in dict.fromkeys(generated.post_ids)
+            if item_id in post_by_id
+        ]
+        refs = {
+            "locations": [
+                {k: v for k, v in loc_summary(item).items()
+                 if k not in ("contentTypeId", "longitude", "latitude")}
+                for item in selected_locations
+            ],
+            "posts": [
+                {"id": item.id, "category": item.category, "title": item.title}
+                for item in selected_posts
+            ],
+        }
+        return success({
+            "answer": normalize_chat_answer(generated.answer),
+            "references": refs,
+        })
     except RateLimitError:
         fail(429, "CHAT_RATE_LIMIT_EXCEEDED", "채팅 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.", {"retryAfterSeconds": 30})
     except Exception as exc:
